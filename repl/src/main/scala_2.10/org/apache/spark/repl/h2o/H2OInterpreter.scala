@@ -23,57 +23,25 @@
 package org.apache.spark.repl.h2o
 
 
-import java.net.URI
+import java.io.File
 
 import org.apache.spark.SparkContext
 import org.apache.spark.util.Utils
 
-import scala.Predef.{println => _, _}
 import scala.language.{existentials, implicitConversions, postfixOps}
 import scala.reflect._
 import scala.tools.nsc._
-import scala.tools.nsc.util._
+
 
 /**
   * H2O Interpreter which is use to interpret scala code
- *
+  *
   * @param sparkContext spark context
   * @param sessionId session ID for interpreter
   */
 class H2OInterpreter(sparkContext: SparkContext, sessionId: Int) extends BaseH2OInterpreter(sparkContext, sessionId) {
 
-
-  private def getAddedJars(): Array[String] = {
-    val conf = sparkContext.getConf
-    val envJars = sys.env.get("ADD_JARS")
-    if (envJars.isDefined) {
-      logWarning("ADD_JARS environment variable is deprecated, use --jar spark submit argument instead")
-    }
-    val jars = {
-      val userJars = Utils.getUserJars(conf, isShell = true)
-      if (userJars.isEmpty) {
-        envJars.getOrElse("")
-      } else {
-        userJars.mkString(",")
-      }
-    }
-    Utils.resolveURIs(jars).split(",").filter(_.nonEmpty)
-  }
-
   override def createInterpreter(): H2OIMain = {
-    val addedJars =
-      if (Utils.isWindows) {
-        // Strip any URI scheme prefix so we can add the correct path to the classpath
-        // e.g. file:/C:/my/path.jar -> C:/my/path.jar
-        getAddedJars().map { jar => new URI(jar).getPath.stripPrefix("/") }
-      } else {
-        // We need new URI(jar).getPath here for the case that `jar` includes encoded white space (%20).
-        getAddedJars().map { jar => new URI(jar).getPath }
-      }
-    // work around for Scala bug
-    val totalClassPath = addedJars.foldLeft(
-      settings.classpath.value)((l, r) => ClassPath.join(l, r))
-    this.settings.classpath.value = totalClassPath
     H2OIMain.createInterpreter(sparkContext, settings, responseWriter, sessionId)
   }
 
@@ -87,14 +55,38 @@ class H2OInterpreter(sparkContext: SparkContext, sessionId: Int) extends BaseH2O
     // This solves problem explained here: https://gist.github.com/harrah/404272
     settings.usejavacp.value = true
     val loader = classTag[H2OInterpreter].runtimeClass.getClassLoader
-    val method = settings.getClass.getSuperclass.getDeclaredMethod("getClasspath",classOf[String],classOf[ClassLoader])
+    val method = settings.getClass.getSuperclass.getDeclaredMethod("getClasspath", classOf[String], classOf[ClassLoader])
     method.setAccessible(true)
-    if(method.invoke(settings, "app",loader).asInstanceOf[Option[String]].isDefined){
+    if (method.invoke(settings, "app", loader).asInstanceOf[Option[String]].isDefined) {
       settings.usejavacp.value = false
       settings.embeddedDefaults(loader)
     }
 
+    val conf = sparkContext.getConf
+    val localJars = {
+      conf.getOption("spark.repl.local.jars") match { /* starting Spark 2.2.1. See SPARK-21714 */
+        case Some(s:String) => s.split(",").filter(_.nonEmpty).toSeq
+        case None => Utils.unionFileLists(
+          conf.getOption("spark.yarn.dist.jars"),
+          conf.getOption("spark.jars")
+        ).toSeq
+      }
+    }
+    val jars = localJars.mkString(File.pathSeparator)
+    val interpArguments = List(
+      "-Yrepl-class-based", // ensure that lines in REPL are wrapped in the classes instead of objects
+      "-Yrepl-outdir", s"${H2OInterpreter.classOutputDirectory.getAbsolutePath}",
+      "-classpath", jars
+    )
+
+    settings.processArguments(interpArguments, processAll = true)
+
     settings
+  }
+
+
+  override def valueOfTerm(term: String): Option[Any] = {
+    try Some(intp.eval(term))  catch { case _ : Exception => None }
   }
 }
 
